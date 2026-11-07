@@ -29,6 +29,7 @@ Each entry records a design decision, the context behind it, and its consequence
 ---
 
 ## ADR-004: Run PySpark locally in Docker
+**Status:** Amended by ADR-011
 
 **Context:** Spark could run on Databricks or locally.
 **Decision:** Local Spark in Docker, orchestrated by Airflow.
@@ -81,3 +82,11 @@ Each entry records a design decision, the context behind it, and its consequence
 **Context:** Embeddings could come from a paid API or a local model.
 **Decision:** A local sentence-transformer model, starting with a subset of narratives.
 **Consequences:** No per-call cost; slower on CPU. The model name is stored with each embedding so a future model change can be tracked and re-run.
+
+---
+
+## ADR-011: Run Spark in local mode inside the Airflow image (amends ADR-004)
+
+**Context:** ADR-004 planned a separate Spark container. On a single laptop, a standalone Spark cluster adds no compute, requires matching Python versions across images and driver networking between containers, and uses extra memory.
+**Decision:** Install Java 17 and PySpark into a custom Airflow image and run jobs with `spark-submit --master local[*]`.
+**Consequences:** Simpler and more reliable locally. Jobs remain standalone `spark-submit` scripts, so moving to a cluster or Databricks means changing `--master`, not rewriting jobs. Spark shares memory with the Airflow scheduler, so Docker needs enough memory allocated.

@@ -46,21 +46,24 @@ The project is built to demonstrate:
 
 ### Known analytical limitations
 - **Counts reflect company size.** The data has no customer base figures, so companies are compared on rates and shares, not raw counts.
-- **Some fields cover limited periods.** For example, `consumer_disputed` was discontinued in 2017, and narratives are only available up to 14 August 2026.
-- **Narratives are a subset.** They exist only where the consumer consented to publication.
+- **One product dominates.** Credit reporting is about 90% of complaints, so dashboards need a product filter and comparisons should be made within products.
+- **Narratives are limited.** They exist only where the consumer consented to publication, stopped on 14 August 2026, and are almost absent from the most recent exports.
+- **Some fields no longer exist.** Consumer consent and consumer disputed are in neither the archive nor the API.
 
 ---
 
 ## 3. Data sources
 
-| Source | Content | Coverage | Load pattern |
-|---|---|---|---|
-| CFPB narratives archive (FOIA reading room) | Full records including narratives | Dec 2011 – 14 Aug 2026 | One-off historical backfill |
-| CFPB Consumer Complaint Database API | Structured fields only (no narratives) | Ongoing, updates daily | Daily incremental |
+| Source | Content | Coverage | Format | Load pattern |
+|---|---|---|---|---|
+| CFPB narratives archive (FOIA reading room) | Full records including narratives (16 columns) | Dec 2011 – Aug 2026, in 21 zip files covering periods of different lengths | One CSV per zip | One-off historical backfill, looping over the 21 files |
+| CFPB Consumer Complaint Database API | Structured fields only (15 fields, no narratives) | Ongoing, updates daily | JSON | Daily, re-fetching a rolling 180-day window |
 
-Expected fields (to verify during ingestion): complaint ID, date received, product, sub-product, issue, sub-issue, narrative, company public response, company, state, ZIP code, tags, consent provided, submitted via, date sent to company, company response to consumer, timely response, consumer disputed.
+**Fields (both sources):** complaint ID, date received, product, sub-product, issue, sub-issue, company public response, company, state, ZIP code, tags, submitted via, date sent to company, company response to consumer, timely response.
+**Archive only:** consumer complaint narrative.
+**In neither source:** consumer consent, consumer disputed.
 
-The two sources differ in schema (the API lacks narratives), so conforming them is an explicit pipeline step.
+The sources differ in schema (the API lacks narratives), so conforming them is an explicit pipeline step. Full profiling results are in `docs/data-exploration.md`.
 
 ---
 
@@ -119,7 +122,8 @@ flowchart TD
 
 ## 6. Transformation approach: EtLT
 
-- **Small "t" in Spark, before loading:** technical transformations only — type enforcement, deduplication, mapping the 2017 and 2023 product/issue category changes to the current taxonomy, partitioning. No business logic.
+- **Small "t" in Spark, before loading:** technical transformations only: renaming columns to snake_case (source names contain spaces and `?`), casting both date columns from text, type enforcement, deduplication, mapping the 2017 and 2023 product/issue category changes to the current taxonomy, and partitioning. No business logic.
+
 - **Big "T" in dbt, inside Snowflake (ELT):** all business logic, metrics, flags and the dimensional model, version-controlled and tested.
 
 **Trade-off acknowledged:** at this volume Snowflake could do the cleaning alone. Spark is used so that conforming logic is independent of the warehouse and the silver layer is usable by any engine.
@@ -149,12 +153,13 @@ Kimball dimensional modelling. Inmon (3NF enterprise warehouse) and Data Vault w
 - `dim_product` — product and sub-product, using conformed categories
 - `dim_issue` — issue and sub-issue, using conformed categories
 - `dim_geography` — state and ZIP prefix
-- `dim_complaint_profile` — junk dimension combining low-cardinality flags: submission channel, tags, consent status, company response
+- `dim_complaint_profile` — junk dimension combining low-cardinality flags: submission channel, tags, company response
 
 **Aggregate marts**
 - e.g. `mart_company_monthly` for dashboard performance
 
 ### Conventions
+- **Closed status:** a complaint is closed when its response starts with "Closed". "In progress" and "Untimely response" are not closed. This drives `is_closed`, `date_closed` and `days_to_close`.
 - **Open milestones:** measures stay `NULL` (never `0`) so averages only include completed milestones; date keys point to `-1` rather than `NULL` so joins never drop rows.
 - **Surrogate keys:** generated in dbt with `dbt_utils.generate_surrogate_key`.
 - **Current state:** the profile key on the fact reflects the complaint's latest response; history lives in the snapshot.
@@ -226,7 +231,6 @@ erDiagram
         string complaint_profile_key PK
         string submitted_via
         string tags
-        string consent_provided
         string company_response
     }
     COMPLAINT_NARRATIVES {
@@ -251,6 +255,8 @@ erDiagram
 
 ## 8. Change tracking
 
+- **Where changes come from:** older archive exports hold mostly final states (the July – August 2025 export has no "In progress" complaints). Recent complaints change after publication: 55% of August 2026 complaints were "In progress", and public responses can be added up to 180 days later. These changes appear only in the API.
+- **Rolling window:** the daily load re-fetches all complaints received in the last 180 days, because a complaint's received date does not change when its status does (ADR-012).
 - **Mechanism:** a dbt snapshot (`snap_complaints`) on `raw.complaints` records every observed version of each complaint using SCD Type 2 columns (`dbt_valid_from`, `dbt_valid_to`).
 - **Model:** `int_complaint_milestones` derives `date_closed` as the earliest `dbt_valid_from` at which the response became a closed status; `fct_complaints` uses it.
 - **Not CDC:** this is query-based change tracking. Log-based CDC is not possible because the source database is not ours.
@@ -263,11 +269,13 @@ erDiagram
 
 ## 9. AI layer
 
-- **Corpus:** narratives from the archive. Initially a subset (e.g. two products over two years) to keep embedding time and cost manageable.
-- **Chunking:** split long narratives into overlapping chunks; short ones stay whole.
+- **Corpus:** narratives for banking products (checking or savings account, credit card, money transfer, mortgage) from the July – August 2025 archive export: 21,904 narratives (ADR-013). Recent exports have almost no narratives. Can expand to all non-credit-reporting products (48,609) by changing a filter.
+- **Minimum length:** narratives under 50 characters are excluded (46 rows, 0.02%), as they carry no meaning for retrieval.
+- **Chunking:** narratives have a median of 736 and a maximum of 31,498 characters, while the embedding model reads roughly 1,000 characters at most. Narratives are split into ~800-character chunks with ~100-character overlap (ADR-014).
 - **Embeddings:** an open-source sentence model run locally (e.g. `all-MiniLM-L6-v2`, 384 dimensions), stored in a Snowflake `VECTOR` column with the model name for traceability.
 - **Incremental:** only chunks without an embedding for the current model are processed.
 - **Retrieval:** filter on star-schema attributes (product, company, date) first, then rank by vector similarity.
+- **Privacy:** narratives are already anonymised by the CFPB (56% contain `XXXX` redactions). Stored text is unchanged; the app may display `XXXX` as `[redacted]` for readability.
 - **App:** Streamlit; the LLM answers using retrieved chunks and cites complaint IDs.
 - **Evaluation:** a fixed set of ~20 questions with expected relevant complaints, used to measure retrieval quality when chunking or models change.
 
@@ -276,10 +284,10 @@ erDiagram
 ## 10. Orchestration
 
 **DAG 1 — `historical_backfill`** (manual trigger, runs once)
-download archive → bronze → Spark → silver → `COPY INTO` raw → dbt snapshot → dbt build
+loop over the 21 archive files: download → bronze → Spark → silver → `COPY INTO` raw → dbt build
 
 **DAG 2 — `daily_complaints`** (daily)
-API pull → bronze → Spark → silver → `COPY INTO` raw → `dbt snapshot` → `dbt build` → embed new chunks
+API pull of complaints received in the last 180 days → bronze → Spark → silver → `COPY INTO` raw → `dbt snapshot` → `dbt build` → embed new chunks
 
 - **Retries** with backoff on network-bound tasks
 - **Alerts** on task failure via callback (Slack or email)
@@ -294,9 +302,9 @@ API pull → bronze → Spark → silver → `COPY INTO` raw → `dbt snapshot` 
 |---|---|
 | Spark | Schema enforcement; row counts in vs out; duplicate `complaint_id` count |
 | Sources | dbt source freshness on `raw.complaints` |
-| Staging | `not_null` and `unique` on `complaint_id`; `accepted_values` on response and channel fields |
+| Staging | `not_null` on complaint ID, date received, date sent to company, product, issue, company, submitted via, company response and timely response; `unique` on complaint ID; `accepted_values` on company response, timely response and submitted via. No `not_null` on tags, company public response, sub-issue, state or ZIP code (optional fields, missing by design) |
 | Marts | `relationships` from every fact key to its dimension; singular tests (e.g. `date_sent >= date_received`, `days_to_close` is `NULL` when not closed) |
-| AI | Every chunk has exactly one embedding for the current model |
+| AI | Every chunk has exactly one embedding for the current model; no narrative under 50 characters is embedded |
 
 ---
 
@@ -324,9 +332,13 @@ API pull → bronze → Spark → silver → `COPY INTO` raw → `dbt snapshot` 
 
 ## 14. Open questions
 
-- [ ] Archive file formats and total size
+## 14. Open questions
+
+- [x] Archive file format: one CSV per zip, 16 columns
+- [ ] Archive total size: largest zip is 135 MB; full total to be measured during ingestion
 - [ ] API pagination, rate limits and how to filter by date
 - [ ] Does the API expose a closing date or last-updated timestamp?
 - [ ] Full list of product/issue category changes to conform
-- [ ] Which narrative subset to embed first
+- [x] Which narrative subset to embed first: banking products, July – August 2025 export (ADR-013)
 - [ ] LLM provider for the RAG app
+- [ ] Why the August 2026 file contains dates after 14 August
